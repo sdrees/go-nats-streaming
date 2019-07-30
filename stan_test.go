@@ -1,3 +1,15 @@
+// Copyright 2016-2018 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 package stan
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -9,6 +21,8 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"net"
+	"os"
 	"runtime"
 	"strconv"
 	"strings"
@@ -17,15 +31,26 @@ import (
 	"testing"
 	"time"
 
-	natsd "github.com/nats-io/gnatsd/test"
-	"github.com/nats-io/go-nats"
-	"github.com/nats-io/go-nats-streaming/pb"
+	natsd "github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats-streaming-server/server"
-	"github.com/nats-io/nats-streaming-server/test"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/stan.go/pb"
 )
 
 func RunServer(ID string) *server.StanServer {
-	return test.RunServer(ID)
+	s, err := server.RunServer(ID)
+	if err != nil {
+		panic(err)
+	}
+	return s
+}
+
+func runServerWithOpts(sOpts *server.Options) *server.StanServer {
+	s, err := server.RunServerWithOpts(sOpts, nil)
+	if err != nil {
+		panic(err)
+	}
+	return s
 }
 
 // Dumb wait program to sync on callbacks, etc... Will timeout
@@ -40,6 +65,23 @@ func WaitTime(ch chan bool, timeout time.Duration) error {
 	case <-time.After(timeout):
 	}
 	return errors.New("timeout")
+}
+
+func TestVersionMatchesTag(t *testing.T) {
+	tag := os.Getenv("TRAVIS_TAG")
+	if tag == "" {
+		t.SkipNow()
+	}
+	// We expect a tag of the form vX.Y.Z. If that's not the case,
+	// we need someone to have a look. So fail if first letter is not
+	// a `v`
+	if tag[0] != 'v' {
+		t.Fatalf("Expect tag to start with `v`, tag is: %s", tag)
+	}
+	// Strip the `v` from the tag for the version comparison.
+	if Version != tag[1:] {
+		t.Fatalf("Version (%s) does not match tag (%s)", Version, tag[1:])
+	}
 }
 
 func TestNoNats(t *testing.T) {
@@ -200,11 +242,16 @@ func TestBasicPublishAsync(t *testing.T) {
 }
 
 func TestTimeoutPublish(t *testing.T) {
-	// Run a NATS Streaming server
-	s := RunServer(clusterName)
-	defer s.Shutdown()
+	ns := natsd.RunDefaultServer()
+	defer ns.Shutdown()
 
+	opts := server.GetDefaultOptions()
+	opts.NATSServerURL = nats.DefaultURL
+	opts.ID = clusterName
+	s := runServerWithOpts(opts)
+	defer s.Shutdown()
 	sc, err := Connect(clusterName, clientName, PubAckWait(50*time.Millisecond))
+
 	if err != nil {
 		t.Fatalf("Expected to connect correctly, got err %v\n", err)
 	}
@@ -1354,7 +1401,7 @@ func TestMaxChannels(t *testing.T) {
 	opts.MaxChannels = 10
 
 	// Run a NATS Streaming server
-	s := test.RunServerWithOpts(opts, nil)
+	s := runServerWithOpts(opts)
 	defer s.Shutdown()
 
 	sc := NewDefaultConnection(t)
@@ -1615,7 +1662,7 @@ func TestTimeoutOnRequests(t *testing.T) {
 	opts := server.GetDefaultOptions()
 	opts.ID = clusterName
 	opts.NATSServerURL = nats.DefaultURL
-	s := test.RunServerWithOpts(opts, nil)
+	s := runServerWithOpts(opts)
 	defer s.Shutdown()
 
 	sc := NewDefaultConnection(t)
@@ -2068,4 +2115,498 @@ func TestSubIsValid(t *testing.T) {
 	if sub.IsValid() {
 		t.Fatal("Subscription should not be valid")
 	}
+}
+
+func TestPingsInvalidOptions(t *testing.T) {
+	s := RunServer(clusterName)
+	defer s.Shutdown()
+	for _, test := range []struct {
+		name string
+		opt  Option
+	}{
+		{
+			"Negative interval",
+			Pings(-1, 10),
+		},
+		{
+			"Zero interval",
+			Pings(-1, 10),
+		},
+		{
+			"Negative maxOut ",
+			Pings(1, -1),
+		},
+		{
+			"Too small maxOut",
+			Pings(1, 1),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			sc, err := Connect(clusterName, clientName, test.opt)
+			if sc != nil {
+				sc.Close()
+			}
+			if err == nil {
+				t.Fatalf("Expected error")
+			}
+		})
+	}
+}
+
+func pingInMillis(interval int) int {
+	return interval * -1
+}
+
+func TestPings(t *testing.T) {
+	s := RunServer(clusterName)
+	defer s.Shutdown()
+
+	testAllowMillisecInPings = true
+	defer func() { testAllowMillisecInPings = false }()
+
+	// Create a sub on the subject the pings are sent to
+	nc, err := nats.Connect(nats.DefaultURL)
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	count := 0
+	ch := make(chan bool, 1)
+	nc.Subscribe(DefaultDiscoverPrefix+"."+clusterName+".pings", func(m *nats.Msg) {
+		count++
+		// Wait more than the number of maxOut
+		if count == 10 {
+			ch <- true
+		}
+	})
+
+	errCh := make(chan error, 1)
+	sc, err := Connect(clusterName, clientName,
+		Pings(pingInMillis(50), 5),
+		SetConnectionLostHandler(func(sc Conn, err error) {
+			errCh <- err
+		}))
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer sc.Close()
+
+	if err := Wait(ch); err != nil {
+		t.Fatal("Did not get our pings")
+	}
+	// Kill the server and expect the error callback to fire
+	s.Shutdown()
+	select {
+	case e := <-errCh:
+		if e != ErrMaxPings {
+			t.Fatalf("Expected error %v, got %v", ErrMaxPings, e)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Error callback should have fired")
+	}
+	// Check that connection is closed.
+	c := sc.(*conn)
+	c.RLock()
+	c.pingMu.Lock()
+	timerIsNil := c.pingTimer == nil
+	c.pingMu.Unlock()
+	c.RUnlock()
+	if !timerIsNil {
+		t.Fatalf("Expected timer to be nil")
+	}
+	if sc.NatsConn() != nil {
+		t.Fatalf("Expected nats conn to be nil")
+	}
+
+	s = RunServer(clusterName)
+	defer s.Shutdown()
+
+	sc, err = Connect(clusterName, clientName,
+		Pings(pingInMillis(50), 100),
+		SetConnectionLostHandler(func(sc Conn, err error) {
+			errCh <- err
+		}))
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer sc.Close()
+
+	// Kill NATS connection, expect different error
+	sc.NatsConn().Close()
+	select {
+	case e := <-errCh:
+		if e != nats.ErrConnectionClosed {
+			t.Fatalf("Expected error %v, got %v", nats.ErrConnectionClosed, e)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Error callback should have fired")
+	}
+}
+
+func TestPingsCloseUnlockPubCalls(t *testing.T) {
+	ns := natsd.RunDefaultServer()
+	defer ns.Shutdown()
+
+	testAllowMillisecInPings = true
+	defer func() { testAllowMillisecInPings = false }()
+
+	opts := server.GetDefaultOptions()
+	opts.NATSServerURL = nats.DefaultURL
+	opts.ID = clusterName
+	s := runServerWithOpts(opts)
+	defer s.Shutdown()
+
+	sc, err := Connect(clusterName, clientName,
+		MaxPubAcksInflight(1),
+		Pings(pingInMillis(50), 10))
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer sc.Close()
+
+	s.Shutdown()
+
+	total := 100
+	ch := make(chan bool, 1)
+	ec := int32(0)
+	ah := func(g string, e error) {
+		if c := atomic.AddInt32(&ec, 1); c == int32(total) {
+			ch <- true
+		}
+	}
+	wg := sync.WaitGroup{}
+	wg.Add(total)
+	for i := 0; i < total/2; i++ {
+		go func() {
+			sc.PublishAsync("foo", []byte("hello"), ah)
+			wg.Done()
+		}()
+		go func() {
+			if err := sc.Publish("foo", []byte("hello")); err != nil {
+				if c := atomic.AddInt32(&ec, 1); c == int32(total) {
+					ch <- true
+				}
+			}
+			wg.Done()
+		}()
+	}
+	if err := Wait(ch); err != nil {
+		t.Fatal("Did not get all the expected failures")
+	}
+	wg.Wait()
+}
+
+func TestConnErrHandlerNotCalledOnNormalClose(t *testing.T) {
+	s := RunServer(clusterName)
+	defer s.Shutdown()
+
+	errCh := make(chan error, 1)
+	sc, err := Connect(clusterName, clientName,
+		SetConnectionLostHandler(func(_ Conn, err error) {
+			errCh <- err
+		}))
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	sc.Close()
+	select {
+	case <-errCh:
+		t.Fatalf("ConnErrHandler should not have been invoked in normal close")
+	case <-time.After(250 * time.Millisecond):
+		// ok
+	}
+}
+
+type pubFailsOnClientReplacedDialer struct {
+	sync.Mutex
+	conn net.Conn
+	fail bool
+	ch   chan bool
+}
+
+func (d *pubFailsOnClientReplacedDialer) Dial(network, address string) (net.Conn, error) {
+	d.Lock()
+	defer d.Unlock()
+	if d.fail {
+		return nil, fmt.Errorf("error on purpose")
+	}
+	c, err := net.Dial(network, address)
+	if err != nil {
+		return nil, err
+	}
+	d.conn = c
+	d.ch <- true
+	return c, nil
+}
+
+func TestPubFailsOnClientReplaced(t *testing.T) {
+	s := RunServer(clusterName)
+	defer s.Shutdown()
+
+	cd := &pubFailsOnClientReplacedDialer{ch: make(chan bool, 1)}
+
+	nc, err := nats.Connect(nats.DefaultURL,
+		nats.MaxReconnects(-1),
+		nats.ReconnectWait(50*time.Millisecond),
+		nats.SetCustomDialer(cd))
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer nc.Close()
+
+	// Consume dial success notification
+	<-cd.ch
+
+	sc, err := Connect(clusterName, clientName, NatsConn(nc))
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	// Send a message and ensure it is ok.
+	if err := sc.Publish("foo", []byte("hello")); err != nil {
+		t.Fatalf("Error on publish: %v", err)
+	}
+
+	// Cause failure of client connection
+	cd.Lock()
+	cd.fail = true
+	cd.conn.Close()
+	cd.Unlock()
+
+	// Create new client with same client ID
+	sc2, err := Connect(clusterName, clientName)
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	// Verify that this client can publish
+	if err := sc2.Publish("foo", []byte("hello")); err != nil {
+		t.Fatalf("Error on publish: %v", err)
+	}
+
+	// Allow first client to "reconnect"
+	cd.Lock()
+	cd.fail = false
+	cd.Unlock()
+
+	// Wait for the reconnect
+	<-cd.ch
+
+	// Wait a bit and try to publish
+	time.Sleep(50 * time.Millisecond)
+	// It should fail
+	if err := sc.Publish("foo", []byte("hello")); err == nil {
+		t.Fatalf("Publish of first client should have failed")
+	}
+}
+
+func TestPingsResponseError(t *testing.T) {
+	s := RunServer(clusterName)
+	defer s.Shutdown()
+
+	testAllowMillisecInPings = true
+	defer func() { testAllowMillisecInPings = false }()
+
+	cd := &pubFailsOnClientReplacedDialer{ch: make(chan bool, 1)}
+
+	nc, err := nats.Connect(nats.DefaultURL,
+		nats.MaxReconnects(-1),
+		nats.ReconnectWait(50*time.Millisecond),
+		nats.SetCustomDialer(cd))
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer nc.Close()
+
+	// Consume dial success notification
+	<-cd.ch
+
+	errCh := make(chan error, 1)
+	sc, err := Connect(clusterName, clientName,
+		NatsConn(nc),
+		// Make it big enough so that we get the response error before we reach the max
+		Pings(pingInMillis(50), 100),
+		SetConnectionLostHandler(func(_ Conn, err error) {
+			errCh <- err
+		}))
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	// Send a message and ensure it is ok.
+	if err := sc.Publish("foo", []byte("hello")); err != nil {
+		t.Fatalf("Error on publish: %v", err)
+	}
+
+	// Cause failure of client connection
+	cd.Lock()
+	cd.fail = true
+	cd.conn.Close()
+	cd.Unlock()
+
+	// Create new client with same client ID
+	sc2, err := Connect(clusterName, clientName)
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	// Verify that this client can publish
+	if err := sc2.Publish("foo", []byte("hello")); err != nil {
+		t.Fatalf("Error on publish: %v", err)
+	}
+
+	// Allow first client to "reconnect"
+	cd.Lock()
+	cd.fail = false
+	cd.Unlock()
+
+	// Wait for the reconnect
+	<-cd.ch
+
+	// Wait for the error callback
+	select {
+	case e := <-errCh:
+		if !strings.Contains(e.Error(), "replaced") {
+			t.Fatalf("Expected error saying that client was replaced, got %v", e)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Error callback not invoked")
+	}
+}
+
+func TestClientIDAndConnIDInPubMsg(t *testing.T) {
+	s := RunServer(clusterName)
+	defer s.Shutdown()
+
+	// By default, when connecting to a 0.10.0+ server, the PubMsg
+	// now only contains a connection ID, not the publish call.
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	c := sc.(*conn)
+	c.RLock()
+	pubSubj := c.pubPrefix
+	connID := c.connID
+	c.RUnlock()
+
+	nc, err := nats.Connect(nats.DefaultURL)
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer nc.Close()
+	ch := make(chan bool, 1)
+	nc.Subscribe(pubSubj+".foo", func(m *nats.Msg) {
+		pubMsg := &pb.PubMsg{}
+		pubMsg.Unmarshal(m.Data)
+		if pubMsg.ClientID == clientName && bytes.Equal(pubMsg.ConnID, connID) {
+			ch <- true
+		}
+	})
+	nc.Flush()
+
+	if sc.Publish("foo", []byte("hello")); err != nil {
+		t.Fatalf("Error on publish: %v", err)
+	}
+	// Verify that client ID and ConnID are properly set
+	if err := Wait(ch); err != nil {
+		t.Fatal("Invalid ClientID and/or ConnID")
+	}
+}
+
+func TestRaceOnSubscribeAndConnClose(t *testing.T) {
+	s := RunServer(clusterName)
+	defer s.Shutdown()
+
+	cb := func(_ *Msg) {}
+	for i := 0; i < 100; i++ {
+		sc := NewDefaultConnection(t)
+		wg := sync.WaitGroup{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				if _, err := sc.Subscribe("foo", cb); err != nil {
+					return
+				}
+			}
+		}()
+		// It's not a mistake.. not millisecond, just nano.
+		// The runtime.Gosched() is not helping producing the race,
+		// but calling Sleep() with tiny amount does.
+		time.Sleep(time.Duration(rand.Intn(50)))
+		sc.Close()
+		wg.Wait()
+	}
+}
+
+func TestNATSSubscriptionLeakOnFailedConnect(t *testing.T) {
+	s := RunServer(clusterName)
+	defer s.Shutdown()
+
+	sc1 := NewDefaultConnection(t)
+	defer sc1.Close()
+
+	nc, err := nats.Connect(nats.DefaultURL)
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer nc.Close()
+
+	// The very first time the library will issue a request reply, the NATS
+	// library will create a wildcard subscription on inbox. So don't count
+	// this one.
+	orgNumSubs := nc.NumSubscriptions() + 1
+
+	for i := 0; i < 10; i++ {
+		if _, err := Connect(clusterName, clientName, NatsConn(nc)); err == nil {
+			t.Fatalf("Expected failure to connect")
+		}
+	}
+
+	ok := false
+	for i := 0; i < 10; i++ {
+		if curNumsubs := nc.NumSubscriptions(); curNumsubs != orgNumSubs {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		ok = true
+		break
+	}
+	if !ok {
+		t.Fatalf("Extra subscriptions: %v", nc.NumSubscriptions()-orgNumSubs)
+	}
+}
+
+func TestNoMemoryLeak(t *testing.T) {
+	s := RunServer(clusterName)
+	defer s.Shutdown()
+
+	runtime.GC()
+
+	oldMem := runtime.MemStats{}
+	runtime.ReadMemStats(&oldMem)
+
+	for i := 0; i < 500; i++ {
+		sc := NewDefaultConnection(t)
+		if _, err := sc.Subscribe("foo", func(_ *Msg) {}); err != nil {
+			t.Fatalf("Error on subscribe: %v", err)
+		}
+		if _, err := sc.PublishAsync("foo", []byte("hello"), nil); err != nil {
+			t.Fatalf("Error on publish: %v", err)
+		}
+		sc.Close()
+	}
+
+	oldInUse := oldMem.HeapInuse
+	oneMB := uint64(1024 * 1024)
+	var newInUse uint64
+
+	for i := 0; i < 5; i++ {
+		runtime.GC()
+
+		newMem := runtime.MemStats{}
+		runtime.ReadMemStats(&newMem)
+		newInUse = newMem.HeapInuse
+
+		if newInUse-oldInUse <= 5*oneMB {
+			return
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	t.Fatalf("Heap in use seem high: old=%vMB - new=%vMB", oldInUse/oneMB, newInUse/oneMB)
 }

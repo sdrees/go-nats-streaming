@@ -1,4 +1,15 @@
-// Copyright 2016 Apcera Inc. All rights reserved.
+// Copyright 2016-2018 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 // Package stan is a Go client for the NATS Streaming messaging system (https://nats.io).
 package stan
@@ -8,8 +19,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nats-io/go-nats"
-	"github.com/nats-io/go-nats-streaming/pb"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/stan.go/pb"
 )
 
 const (
@@ -28,16 +39,8 @@ type Msg struct {
 // Subscriptions and Options
 
 // Subscription represents a subscription within the NATS Streaming cluster. Subscriptions
-// will be rate matched and follow at-least delivery semantics.
+// will be rate matched and follow at-least once delivery semantics.
 type Subscription interface {
-	ClearMaxPending() error
-	Delivered() (int64, error)
-	Dropped() (int, error)
-	IsValid() bool
-	MaxPending() (int, int, error)
-	Pending() (int, int, error)
-	PendingLimits() (int, int, error)
-	SetPendingLimits(msgLimit, bytesLimit int) error
 	// Unsubscribe removes interest in the subscription.
 	// For durables, it means that the durable interest is also removed from
 	// the server. Restarting a durable with the same name will not resume
@@ -49,6 +52,42 @@ type Subscription interface {
 	// for which this feature is not available, Close() will return a ErrNoServerSupport
 	// error.
 	Close() error
+
+	// These functions have been added for expert-users that need to get details
+	// about the low level NATS Subscription used internally to receive messages
+	// for this streaming subscription. They are documented in the Go client
+	// library: https://godoc.org/github.com/nats-io/nats.go#Subscription.ClearMaxPending
+
+	// ClearMaxPending resets the maximums seen so far.
+	ClearMaxPending() error
+
+	// Delivered returns the number of delivered messages for the internal low-level NATS subscription.
+	Delivered() (int64, error)
+
+	// Dropped returns the number of known dropped messages for the internal low-level NATS subscription.
+	// This will correspond to messages dropped by violations of PendingLimits. If the server declares
+	// the connection a SlowConsumer, this number may not be valid.
+	Dropped() (int, error)
+
+	// IsValid returns a boolean indicating whether the internal low-level NATS subscription is still active.
+	// This will return false if the subscription has already been closed.
+	IsValid() bool
+
+	// MaxPending returns the maximum number of queued messages and queued bytes seen so far for the internal
+	// low-level NATS subscription.
+	MaxPending() (int, int, error)
+
+	// Pending returns the number of queued messages and queued bytes in the client for the internal
+	// low-level NATS subscription.
+	Pending() (int, int, error)
+
+	// PendingLimits returns the current limits for the internal low-level NATS subscription. If no error is
+	// returned, a negative value indicates that the given metric is not limited.
+	PendingLimits() (int, int, error)
+
+	// SetPendingLimits sets the limits for pending msgs and bytes for the internal low-level NATS Subscription.
+	// Zero is not allowed. Any negative value means that the given metric is not limited.
+	SetPendingLimits(msgLimit, bytesLimit int) error
 }
 
 // A subscription represents a subscription to a stan cluster.
@@ -172,7 +211,7 @@ func SetManualAckMode() SubscriptionOption {
 	}
 }
 
-// DurableName sets the DurableName for the subcriber.
+// DurableName sets the DurableName for the subscriber.
 func DurableName(name string) SubscriptionOption {
 	return func(o *SubscriptionOptions) error {
 		o.DurableName = name
@@ -242,7 +281,7 @@ func (sc *conn) subscribe(subject, qgroup string, cb MsgHandler, options ...Subs
 	}
 
 	b, _ := sr.Marshal()
-	reply, err := sc.nc.Request(sc.subRequests, b, sc.opts.ConnectTimeout)
+	reply, err := nc.Request(sc.subRequests, b, sc.opts.ConnectTimeout)
 	if err != nil {
 		sub.inboxSub.Unsubscribe()
 		if err == nats.ErrTimeout {
